@@ -1,0 +1,18 @@
+# Core
+google-genai==1.63.0
+streamlit==1.54.0
+debugpy>=1.8,<2
+psycopg[binary]>=3.1,<4
+sqlalchemy>=2.0,<3
+
+# Document AI Layout Parser (DOCX routing)
+google-cloud-documentai>=2.29,<3
+
+# Retry logic
+tenacity>=9.0,<10
+
+# Schema migrations
+alembic>=1.13,<2
+
+# .env auto-loading
+python-dotenv>=1.0,<2

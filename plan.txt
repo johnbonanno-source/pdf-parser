@@ -1,0 +1,274 @@
+PLAN: Harden Parse-Store Pipeline & Prepare for Scale
+======================================================
+
+The current codebase is a working prototype with tight coupling between UI,
+LLM, and persistence. This plan restructures it into clean layers -- routing
+documents by type (Gemini for PDF/image, Document AI Layout Parser for DOCX),
+abstracting file storage for future S3/GCS, adding a nullable user_id, and
+hardening everything with retries, logging, dedup, indexes, Alembic
+migrations, tests, and proper DevOps scaffolding.
+
+
+STEPS
+-----
+1.a Handle the 503 error with a retry
+ServerError: 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}
+1. Pin dependencies & add new ones (requirements.txt)
+
+   - Pin all existing packages to current versions
+     (e.g. google-genai==1.63.0, streamlit>=1.45, sqlalchemy>=2.0,<3,
+     psycopg[binary]>=3.1)
+   - Add google-cloud-documentai for the Layout Parser backend
+   - Add tenacity for retry logic
+   - Add alembic for schema migrations
+   - Add python-dotenv for .env auto-loading
+   - Add boto3 or google-cloud-storage (depending on cloud preference)
+     behind a feature flag for future object storage
+   - Add pytest, pytest-cov as dev dependencies (separate
+     requirements-dev.txt)
+
+
+2. Introduce a parser abstraction layer
+
+   New files: parsers/__init__.py, parsers/gemini_parser.py,
+              parsers/docai_parser.py, parsers/router.py
+
+   - Extract the Gemini logic from minimal_gemini.py into
+     parsers/gemini_parser.py with a GeminiParser class implementing a
+     Parser protocol:
+       parse(file_bytes, filename, mime_type) -> ParseResult
+
+   - Create parsers/docai_parser.py with a DocAILayoutParser class using
+     google.cloud.documentai_v1. This processes DOCX files via the Layout
+     Parser processor, then maps the DocumentLayout output into the same
+     4-section markdown format using a lightweight post-processing step.
+
+   - Create parsers/router.py with a route_parser(mime_type) -> Parser
+     function:
+       DOCX  -> DocAILayoutParser
+       else  -> GeminiParser  (PDF, image)
+
+   - Define a ParseResult dataclass:
+       markdown: str
+       model_name: str
+       usage_metadata: dict | None
+       parser_backend: str   (e.g. "gemini" or "docai-layout")
+
+   - Delete minimal_gemini.py once migration is complete.
+
+
+3. Harden the Gemini parser (parsers/gemini_parser.py)
+
+   - Set temperature=0 for deterministic extraction via generation_config.
+   - Wrap client.models.generate_content() with tenacity.retry --
+     exponential backoff, max 3 attempts, retry on transient
+     google.api_core.exceptions (429, 503, 500).
+   - After generating, call client.files.delete(sample_file.name) to clean
+     up the server-side upload.
+   - Check response.candidates for blocked content / empty responses before
+     accessing response.text.
+   - Replace global _client with @st.cache_resource or a simple
+     module-level lazy init.
+   - Make model name configurable via env var / Streamlit secrets
+     (GEMINI_MODEL, default gemini-3-flash-preview).
+
+
+4. Separate concerns in the call flow
+
+   The parser should NOT save to DB. Instead:
+   - streamlit_app.py calls router.route_parser(mime_type).parse(...)
+     and gets a ParseResult.
+   - streamlit_app.py then calls protocol_repository.save_protocol_parse(...)
+     with the result.
+   - This makes parsers independently testable and reusable.
+
+
+5. Add deduplication (protocol_repository.py)
+
+   - Before inserting, query:
+       SELECT id FROM protocols
+       WHERE file_sha256 = :hash
+         AND model_name  = :model
+         AND prompt_hash  = :prompt_hash
+   - If a match exists, return the existing id along with a flag
+     already_existed=True (return a small result dataclass instead of
+     bare str).
+   - In the UI, show an info message: "This file was already processed"
+     with a link/download for the existing result.
+
+
+6. Refactor the DB schema (protocol_repository.py)
+
+   - Add Column("user_id", UUID(as_uuid=True), nullable=True)
+     No FK yet, just a placeholder.
+
+   - Add Column("parser_backend", String(32), nullable=False)
+     Values: "gemini" or "docai-layout".
+
+   - Replace source_file LargeBinary with
+     Column("source_file_ref", String(512), nullable=False)
+     A URI/path reference (e.g. postgres-blob://<id> for now,
+     s3://bucket/key later).
+
+   - Create a separate source_files table:
+       id           UUID PK
+       file_sha256  VARCHAR(64) UNIQUE
+       file_bytes   LargeBinary
+       stored_at    TIMESTAMPTZ
+     This deduplicates binary storage (same PDF uploaded twice = one
+     blob row).
+
+   - Add indexes:
+       Index("ix_protocols_file_sha256", protocols.c.file_sha256)
+       Index("ix_protocols_created_at",  protocols.c.created_at)
+       Index("ix_protocols_user_id",     protocols.c.user_id)
+     Add a unique constraint on (file_sha256, model_name, prompt_hash).
+
+   - Remove metadata.create_all() from save_protocol_parse() -- move DDL
+     to Alembic.
+
+
+7. Add a file storage abstraction (new file: file_storage.py)
+
+   - Define protocol:
+       store(file_bytes, sha256) -> str       (returns reference URI)
+       retrieve(ref)             -> bytes
+
+   - Implement PostgresBlobStore first (writes/reads from source_files
+     table).
+
+   - Stub S3Store / GCSStore interface for later -- just raise
+     NotImplementedError with a comment.
+
+   - Select backend via env var FILE_STORAGE_BACKEND=postgres (default),
+     future: s3, gcs.
+
+
+8. Set up Alembic for migrations
+
+   - Run alembic init alembic in the project root.
+   - Configure alembic/env.py to use get_database_url() from db_config.py.
+   - Generate initial migration from the current protocols table
+     definition.
+   - Generate a second migration that adds:
+       user_id column
+       parser_backend column
+       source_files table
+       replaces source_file with source_file_ref
+       adds indexes and unique constraint
+   - Remove all metadata.create_all() calls -- Alembic is the single
+     source of truth for schema.
+
+
+9. Add structured logging (new file: log_config.py)
+
+   - Configure Python logging with JSON formatter for production,
+     human-readable for dev.
+   - Replace all print() calls with logger.info() / logger.debug().
+   - Log: parse requests, Gemini API latency, token usage, DB writes,
+     dedup hits, errors.
+   - Add logger.exception() for error paths.
+
+
+10. Improve configuration (db_config.py + new file: config.py)
+
+    - Add GOOGLE_API_KEY to .env.example and .streamlit/secrets.toml.example.
+    - Add GEMINI_MODEL, FILE_STORAGE_BACKEND, MAX_UPLOAD_SIZE_MB settings.
+    - Add DOCAI_PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID for
+      Document AI Layout Parser.
+    - Load .env automatically via python-dotenv in a config.py module.
+    - Validate all required config at startup -- fail fast with a clear
+      error message.
+
+
+11. Add input validation (streamlit_app.py)
+
+    - Enforce max file size (configurable, default 20 MB to match
+      Document AI's online limit).
+    - Validate MIME type server-side using file magic bytes, not just
+      the extension.
+    - Show clear error messages for unsupported types.
+
+
+12. Improve the Streamlit UI (streamlit_app.py)
+
+    - Use st.session_state to persist results across reruns.
+    - Replace st.exception(e) with user-friendly error messages (log the
+      full traceback server-side).
+    - Add a sidebar or tab for listing previously parsed protocols
+      (query from DB).
+    - Show parser backend used ("Parsed via Gemini" / "Parsed via
+      Document AI Layout Parser").
+
+
+13. Add tests (new directory: tests/)
+
+    - tests/test_protocol_repository.py:
+        Unit tests for save_protocol_parse and dedup logic (mock the
+        engine).
+
+    - tests/test_gemini_parser.py:
+        Test retry behavior, error handling, response validation (mock
+        the Gemini client).
+
+    - tests/test_docai_parser.py:
+        Test Layout Parser output mapping (mock the Document AI client).
+
+    - tests/test_router.py:
+        Test MIME type routing.
+
+    - tests/test_file_storage.py:
+        Test store/retrieve roundtrip.
+
+    - tests/conftest.py:
+        Shared fixtures (in-memory SQLite engine, mock clients).
+
+
+14. DevOps scaffolding
+
+    - Add Dockerfile for the Streamlit app (Python 3.12 slim, install
+      deps, ENTRYPOINT streamlit run).
+    - Add the app service to docker-compose.yml alongside the DB, with
+      depends_on: db and health-check wait.
+    - Add a Makefile or justfile with targets: setup, migrate, run,
+      test, lint.
+    - Add a README.md with setup instructions, architecture overview,
+      env var reference.
+
+
+VERIFICATION
+------------
+
+- Run "alembic upgrade head" against a fresh Postgres container -- schema
+  should match expectations.
+- Run "pytest tests/ -v --cov" -- all tests pass, coverage > 80% for
+  new code.
+- Upload a PDF -> verify Gemini parser is used, result stored, dedup
+  works on re-upload.
+- Upload a DOCX -> verify Document AI Layout Parser is used, same
+  markdown format output.
+- Upload the same file twice -> verify dedup returns existing record.
+- Check logs for structured JSON output with timing and token usage.
+- Run "docker compose up" -> both DB and app should start and be
+  functional.
+
+
+DECISIONS
+---------
+
+- DOCX -> Document AI Layout Parser, PDF/image -> Gemini API:
+  Routes by MIME type. Layout Parser gives structured output natively
+  for DOCX, reducing LLM token spend. Gemini stays primary for
+  PDF/images where the existing prompt engineering already works well.
+
+- Abstracted file storage, Postgres first:
+  The source_files table with a FileStore protocol lets you swap to
+  S3/GCS later without touching the rest of the codebase.
+
+- Nullable user_id now, no auth yet:
+  Schema-ready for user ownership. When auth is added later, backfill
+  the column and add a FK to a users table.
+
+- Alembic over create_all():
+  Single source of truth for schema, supports incremental changes as
+  RAG features are added.
